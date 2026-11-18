@@ -1,0 +1,162 @@
+# Export a full policy pipeline with LEAPP
+
+The optional LEAPP integration exports numerical preprocessing, policy inference, and action postprocessing together. For ACT, one ONNX model takes raw images and state and returns an action chunk with the checkpoint's action unnormalization already applied. Deployment does not load the original policy or processor implementations.
+
+The first checkpoint integration supports ACT on PushT. It uses the pretrained [`aadarshram/act_pusht`](https://huggingface.co/aadarshram/act_pusht) checkpoint and its saved processor statistics; no new training run is required. Existing LeRobot training, inference, and robot-control commands keep their current behavior.
+
+## Install and export
+
+From your LeRobot checkout, install the export and PushT dependencies:
+
+```bash
+uv sync --locked --extra leapp --extra pusht --extra evaluation
+```
+
+The `leapp` extra pins **LEAPP 0.8.1**. Export and deployment use CPU by default. GPU execution and inference speedups are not qualification requirements for this integration.
+
+Export the pinned checkpoint using five distinct, seeded observations from PushT:
+
+```bash
+uv run --no-sync lerobot-export-leapp \
+  --checkpoint_path=aadarshram/act_pusht \
+  --revision=864fd80821cccec9c6783e036684c46be52eda2a \
+  --env.type=pusht \
+  --output_dir=outputs/export/act_pusht \
+  --backend=onnx
+```
+
+The exporter strictly loads the model weights and saved preprocessor/postprocessor state from the same checkpoint revision. It then captures:
+
+```text
+raw RGB + state → image/layout conversion → saved preprocessing → ACT chunk prediction → saved postprocessing
+```
+
+The returned bundle description is `outputs/export/act_pusht/policy/policy.yaml`. Keep **the complete `policy/` directory**, including every referenced model and external-data file. Paths inside the bundle are relative, so the directory can be copied to another location. An existing bundle directory is rejected instead of overwritten.
+
+The captured inputs have fixed keys, shapes, and dtypes. For the pinned checkpoint, these are `observation.image`, a batched HWC `uint8` image of shape `[1, 96, 96, 3]`, and `observation.state`, a `float32` tensor of shape `[1, 2]`. The model includes conversion to BCHW floating-point pixels, division by 255, checkpoint-statistics normalization, ACT inference, and action unnormalization. The output is a fully processed `[1, 100, 2]` action chunk.
+
+## Run the deployment bundle
+
+Evaluate the exported policy for fifty complete PushT episodes with seeds `0–49`:
+
+```bash
+uv run --no-sync lerobot-eval-leapp \
+  --bundle_path=outputs/export/act_pusht/policy/policy.yaml \
+  --output_dir=outputs/eval/act_pusht_leapp \
+  --n_episodes=50 \
+  --start_seed=0
+```
+
+The command writes per-episode results, success rate, and reward summaries to `eval_info.json`. It loads the exported models through LEAPP's existing `InferenceManager`; the deployment module does not import LeRobot policy or processor implementations.
+
+For another application, use the runner directly with observations matching the exported input contract:
+
+```python
+import numpy as np
+
+from lerobot.export.runtime import LeappRunner
+
+runner = LeappRunner("outputs/export/act_pusht/policy/policy.yaml")
+runner.reset()  # Call at the start of every episode.
+
+observation = {
+    "observation.image": np.zeros((1, 96, 96, 3), dtype=np.uint8),
+    "observation.state": np.zeros((1, 2), dtype=np.float32),
+}
+chunk = runner.predict_action_chunk(observation)  # [batch, chunk, action]
+action = runner.select_action(observation)  # [batch, action]
+```
+
+`select_action()` requests a new chunk only when its action queue is empty. It follows the checkpoint's `n_action_steps` setting, discarding any remaining predicted actions beyond that count. `reset()` clears the queue and runtime buffers. Returned tensors have their own storage and remain valid after later inference or reset.
+
+Acquisition, simulator or robot stepping, control timing, chunk scheduling, and episode resets stay outside the numerical graph. The runner checks the declared input contract and schedules chunks; it does not implement a real-time control loop. `predict_action_chunk()` performs an independent prediction and does not refill the `select_action()` queue.
+
+## Export your own numerical callable
+
+`export_pipeline()` can capture deterministic numerical callables independently of ACT. Include every input-dependent transformation inside the callable and return a mapping of named arrays or tensors. All capture samples must have identical keys, shapes, and dtypes.
+
+```python
+import numpy as np
+import torch
+from leapp import InferenceManager
+
+from lerobot.export.annotations import export_semantics
+from lerobot.export.exporter import export_pipeline
+
+
+@export_semantics(
+    inputs={
+        "observation.state": {
+            "axes": [None, {"kind": "element", "names": ["x", "y"]}],
+        }
+    },
+    outputs={
+        "action": {
+            "axes": [None, {"kind": "element", "names": ["x", "y"]}],
+        }
+    },
+)
+def pipeline(observation):
+    state = torch.from_numpy(observation["observation.state"])
+    normalized = (state - 0.5) / 2.0
+    return {"action": torch.tanh(normalized) * 3.0 + 1.0}
+
+
+samples = [
+    {"observation.state": np.array([[value, value + 0.25]], dtype=np.float32)}
+    for value in (0.0, 0.5, 1.0)
+]
+bundle = export_pipeline(pipeline, samples, "outputs/export/custom")
+
+fresh = {"observation.state": np.array([[0.25, 0.75]], dtype=np.float32)}
+manager = InferenceManager(str(bundle))
+actual = manager.run_policy(
+    {"policy/observation_state": torch.from_numpy(fresh["observation.state"]).clone()}
+)["policy/action"].clone()
+torch.testing.assert_close(actual, pipeline(fresh)["action"], rtol=1e-4, atol=1e-4)
+```
+
+The exporter preserves the callable's external keys and records collision-checked internal aliases in `pipeline.configs.lerobot` in the generated YAML. For example, `observation.state` becomes the internal port `policy/observation_state`. Distinct keys that would produce the same alias are rejected. Inspect the saved aliases when binding a custom consumer.
+
+The generic API performs strict validation against its captured samples. Validate additional inputs that were not used during capture before deploying your callable. Generic outputs do not automatically define an action queue; use `InferenceManager` to consume them directly, as above.
+
+## Describe external tensor semantics
+
+`@export_semantics(...)` attaches metadata without wrapping the function or importing LEAPP. The exporter binds those declarations to actual values and constructs LEAPP 0.8.1 `TensorSemantics` and `Axis` descriptors. A declaration can also be a resolver receiving the actual tensor and returning semantic fields. Resolvers should inspect metadata such as shape and must not mutate values or infer a contract from a capture sample's contents.
+
+Use the existing LEAPP fields to describe quantities only when their meaning is established. The ACT/PushT adapter records RGB image meaning, known feature ordering, and the output chunk's time axis. PushT's 10 Hz control rate gives a 100 ms spacing between actions. It does not label generic state/action vectors as joint positions, invent physical units or frames, or treat every batch dimension as a physical system.
+
+The custom example labels the ordered vector elements while leaving their physical quantity unspecified. These labels describe meaning; they do not reorder values, convert units, or change computation. See the [LEAPP semantics documentation](https://nvidia-isaac.github.io/leapp/semantics/usage.html) for the standard quantity and axis vocabulary.
+
+## Supported boundary and qualification
+
+The checkpoint convenience path supports one-observation-step ACT with temporal ensembling disabled, float32 inference, and standard stateless processors. Preprocessing accepts the standard renaming, batch, device, normalization, and identity steps; postprocessing accepts unnormalization, device, and identity steps. Processor hooks and unsupported processor classes are rejected. Saved normalization statistics are retained, and chunk postprocessing must equal processing each native action separately.
+
+The generic export API assumes a stateless numerical callable using supported operations. Stateful processors, tokenizers, stochastic policies, data-dependent Python control flow, and dynamic input shapes need separate adapters and qualification. A successful trace of one execution path does not establish support for those cases.
+
+Run the checkpoint qualification harness from the checkout:
+
+```bash
+uv run --no-sync python examples/leapp/qualify_act.py \
+  --checkpoint-path=aadarshram/act_pusht \
+  --revision=864fd80821cccec9c6783e036684c46be52eda2a \
+  --output-dir=outputs/qualification/act_pusht \
+  --n-episodes=50
+```
+
+The harness writes `report.json` with checkpoint and software provenance, numerical comparisons, scheduling checks, and native/exported rollout results. It uses five capture observations and twenty fresh replay observations, checks action sequences across at least three chunk refills and a reset, and compares all processed action elements with `rtol=1e-4`, `atol=1e-4`. Fresh replay varies images and state independently.
+
+The fifty-episode comparison uses complete episodes with seeds `0–49`. Shared-observation comparisons establish numerical parity; success rates and rewards describe closed-loop behavior, where small numerical changes can lead to different trajectories. The qualification also checks relocated-bundle loading without policy imports, caller-buffer ownership through reset, and the historical in-place ResNet ReLU capture failure using released LEAPP 0.8.1.
+
+### Initial checkpoint results
+
+The pinned checkpoint was qualified on CPU with LEAPP 0.8.1, PyTorch 2.15.0, ONNX Script 0.7.1, and ONNX Runtime 1.31.1. Strict validation passed all five capture observations. All 573 numerical comparisons passed the tolerances above: twenty fresh chunks, 402 scheduled actions across refills and a reset, 150 chunks on shared rollout observations, and one relocated-bundle replay. The maximum absolute action error was `0.000717164` in PushT coordinates. All nine in-place ResNet ReLUs remained enabled; no model workaround was needed.
+
+| Metric, seeds 0–49  | Native checkpoint | Exported deployment |
+| ------------------- | ----------------: | ------------------: |
+| Completed episodes  |                50 |                  50 |
+| Successful episodes |                 0 |                   0 |
+| Mean summed reward  |       39.23253637 |         39.13328844 |
+| Mean maximum reward |        0.36280256 |          0.36277313 |
+
+This checkpoint establishes numerical export and deployment fidelity, but its zero-success native baseline does not demonstrate task competence. The exported policy completed all 15,000 environment steps. No inference speedup is claimed.

@@ -119,6 +119,8 @@
     title: Policy Deployment (lerobot-rollout)
   - local: remote_inference
     title: Remote Inference
+  - local: leapp_export
+    title: Full Pipeline Export with LEAPP
   - local: rtc
     title: Real-Time Chunking (RTC)
   title: "Inference"

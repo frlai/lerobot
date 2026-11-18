@@ -1,0 +1,62 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: LEAPP Export
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "src/lerobot/export/**"
+      - "src/lerobot/scripts/lerobot_*_leapp.py"
+      - "src/lerobot/utils/import_utils.py"
+      - "tests/export/**"
+      - "examples/leapp/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/leapp.yml"
+
+permissions: {}
+
+concurrency:
+  group: leapp-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  export-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      SDL_VIDEODRIVER: dummy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.30"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install optional export and test dependencies
+        run: uv sync --locked --extra leapp --extra pusht --extra evaluation --extra test
+      - name: Run export integration tests
+        run: uv run --no-sync pytest tests/export -v
+      - name: Qualify the pinned public checkpoint
+        if: github.event_name == 'workflow_dispatch'
+        run: uv run --no-sync python examples/leapp/qualify_act.py --output-dir outputs/leapp-qualification
