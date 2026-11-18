@@ -132,6 +132,7 @@ def require_package(pkg_name: str, extra: str, import_name: str | None = None) -
 # Do NOT define ad-hoc ``is_package_available(...)`` calls in other modules.
 
 # ML / training
+_leapp_available = is_package_available("leapp")
 _lancedb_available = is_package_available("lancedb")
 _transformers_available = is_package_available("transformers")
 _peft_available = is_package_available("peft")

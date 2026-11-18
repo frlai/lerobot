@@ -96,6 +96,9 @@ dependencies = [
 # Optional dependencies
 [project.optional-dependencies]
 
+# Full numerical pipeline export and bundle replay; not needed by normal policies.
+leapp = ["leapp==0.8.1"]
+
 # ── Feature-scoped extras ──────────────────────────────────
 lancedb = [
     "lerobot[dataset]",
@@ -401,6 +404,8 @@ all = [
 ]
 
 [project.scripts]
+lerobot-export-leapp="lerobot.scripts.lerobot_export_leapp:main"
+lerobot-eval-leapp="lerobot.scripts.lerobot_eval_leapp:main"
 lerobot-build-mp4-sidecar="lerobot.scripts.lerobot_build_mp4_sidecar:main"
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
 lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
